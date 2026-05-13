@@ -1,12 +1,16 @@
 """Cost estimation logic for Copilot usage.
 
-Mirrors the VS Code extension's costEstimator feature.
+Supports both usage-based billing (June 1, 2026+) and request-based billing with
+model multipliers for annual plan subscribers staying on legacy billing.
+
 All USD values per 1,000,000 tokens unless noted otherwise.
+Source: https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 # ---------------------------------------------------------------------------
@@ -16,6 +20,11 @@ from typing import Literal
 PER_TOKEN_UNIT = 1_000_000          # pricing denominator
 AI_CREDIT_USD_VALUE = 0.01          # $0.01 per AI Credit
 ESTIMATION_MONTH_DAYS = 30          # standard normalisation window
+
+# Billing model transition date
+USAGE_BASED_BILLING_DATE = datetime(2026, 6, 1)  # June 1, 2026
+
+BillingModel = Literal["usage_based", "request_based_legacy"]
 
 # ---------------------------------------------------------------------------
 # Model pricing table
@@ -136,6 +145,55 @@ MODEL_PRICING_LIST: list[ModelPricing] = sorted(
 )
 
 # ---------------------------------------------------------------------------
+# Model multipliers for legacy annual Copilot Pro/Pro+ subscribers (request-based)
+# Source: https://docs.github.com/en/copilot/reference/copilot-billing/model-multipliers-for-annual-plans
+# 
+# Subscribers staying on legacy request-based billing after June 1, 2026 will
+# see these multipliers applied to base request costs. Multiplier 1.0 = base cost.
+# ---------------------------------------------------------------------------
+
+MODEL_MULTIPLIERS: dict[str, float] = {
+    # OpenAI models
+    "gpt-4.1": 1.0,
+    "gpt-5-mini": 0.2,
+    "gpt-5.2": 1.25,
+    "gpt-5.2-codex": 1.25,
+    "gpt-5.3-codex": 1.25,
+    "gpt-5.4": 1.5,
+    "gpt-5.4-mini": 0.5,
+    "gpt-5.4-nano": 0.15,
+    "gpt-5.5": 3.0,
+    
+    # Anthropic models
+    "claude-haiku-4.5": 0.5,
+    "claude-sonnet-4": 1.5,
+    "claude-sonnet-4.5": 1.5,
+    "claude-sonnet-4.6": 1.5,
+    "claude-opus-4.5": 3.0,
+    "claude-opus-4.6": 3.0,
+    "claude-opus-4.7": 3.0,
+    
+    # Google models
+    "gemini-2.5-pro": 1.0,
+    "gemini-3-flash": 0.3,
+    "gemini-3.1-pro": 1.5,
+    
+    # xAI models
+    "grok-code-fast-1": 0.15,
+    
+    # GitHub fine-tuned
+    "raptor-mini": 0.2,
+    "goldeneye": 1.0,
+}
+
+def get_model_multiplier(model_id: str) -> float:
+    """Get request-based billing multiplier for legacy annual plans.
+    
+    Returns 1.0 as default for unknown models.
+    """
+    return MODEL_MULTIPLIERS.get(_strip_prefix(model_id), 1.0)
+
+# ---------------------------------------------------------------------------
 # Plan allowances
 # ---------------------------------------------------------------------------
 
@@ -216,6 +274,12 @@ class ModelCostRow:
     output_cost_usd: float
     total_cost_usd: float
     monthly_credits: int
+    # Optional fields for cached token support (usage-based billing)
+    cached_input_tokens: int = 0
+    cached_read_cost_usd: float = 0.0
+    cache_write_cost_usd: float = 0.0
+    # Billing model identifier
+    billing_model: BillingModel = "usage_based"
 
 
 @dataclass
@@ -329,6 +393,221 @@ def compute_monthly_cost(
         total_monthly_credits=math.ceil(total_usd / AI_CREDIT_USD_VALUE),
         rows=rows,
     )
+
+
+def compute_monthly_cost_request_based(
+    token_rows: list[dict],
+    days_observed: int,
+    base_per_request_usd: float = 0.5,
+) -> CostSummary:
+    """Compute monthly cost under legacy request-based billing with model multipliers.
+    
+    For annual Copilot Pro/Pro+ subscribers staying on legacy billing after June 1, 2026.
+    Applies model multipliers to a base per-request cost.
+    
+    Args:
+        token_rows: list of dicts with ``model_id`` (required), plus optional
+            ``prompt_tokens``, ``output_tokens`` for analytics only
+        days_observed: number of days for normalization
+        base_per_request_usd: base cost per request (default $0.50)
+    
+    Returns:
+        :class:`CostSummary` with per-model breakdown and totals.
+    """
+    days = max(1, days_observed)
+    scale = ESTIMATION_MONTH_DAYS / days
+    
+    rows: list[ModelCostRow] = []
+    total_usd = 0.0
+    total_credits = 0
+    
+    # Group by model to count requests
+    model_request_counts: dict[str, int] = {}
+    for row in token_rows:
+        raw_model = row.get("model_id") or row.get("model") or "unknown"
+        model_request_counts[raw_model] = model_request_counts.get(raw_model, 0) + 1
+    
+    for raw_model, request_count in model_request_counts.items():
+        prompt_obs = int(sum(
+            int(r.get("prompt_tokens", 0) or 0) 
+            for r in token_rows 
+            if (r.get("model_id") or r.get("model")) == raw_model
+        ))
+        output_obs = int(sum(
+            int(r.get("output_tokens", 0) or 0)
+            for r in token_rows
+            if (r.get("model_id") or r.get("model")) == raw_model
+        ))
+        
+        monthly_requests = request_count * scale
+        monthly_prompt = prompt_obs * scale
+        monthly_output = output_obs * scale
+        
+        multiplier = get_model_multiplier(raw_model)
+        pricing = get_model_pricing(raw_model)
+        
+        # Cost = base_rate × multiplier × request_count (normalized to month)
+        row_usd = base_per_request_usd * multiplier * monthly_requests
+        row_credits = math.ceil(row_usd / AI_CREDIT_USD_VALUE)
+        
+        total_usd += row_usd
+        total_credits += row_credits
+        
+        display_name = pricing.display_name if pricing else _strip_prefix(raw_model)
+        provider = pricing.provider if pricing else "Unknown"
+        
+        rows.append(ModelCostRow(
+            model_id=raw_model,
+            display_name=display_name,
+            provider=provider,
+            observed_prompt_tokens=prompt_obs,
+            observed_output_tokens=output_obs,
+            monthly_prompt_tokens=monthly_prompt,
+            monthly_output_tokens=monthly_output,
+            input_cost_usd=row_usd * 0.5,  # Split for display
+            output_cost_usd=row_usd * 0.5,
+            total_cost_usd=row_usd,
+            monthly_credits=row_credits,
+            billing_model="request_based_legacy",
+        ))
+    
+    rows.sort(key=lambda r: r.total_cost_usd, reverse=True)
+    return CostSummary(
+        days_observed=days,
+        total_monthly_usd=total_usd,
+        total_monthly_credits=math.ceil(total_usd / AI_CREDIT_USD_VALUE),
+        rows=rows,
+    )
+
+
+def compute_monthly_cost_with_cache(
+    token_rows: list[dict],
+    days_observed: int,
+    cache_hit_rate: float = 0.0,
+) -> CostSummary:
+    """Compute monthly cost under usage-based billing with prompt caching support.
+    
+    Calculates costs for input, output, cached input reads, and cache writes.
+    
+    Args:
+        token_rows: list of dicts with keys:
+            ``model_id``, ``prompt_tokens``, ``output_tokens``,
+            optionally ``cached_input_tokens``, ``cache_write_tokens``
+        days_observed: number of days for normalization
+        cache_hit_rate: estimated cache hit rate (0.0-1.0) for calculating savings
+    
+    Returns:
+        :class:`CostSummary` with per-model breakdown including cache costs.
+    """
+    days = max(1, days_observed)
+    scale = ESTIMATION_MONTH_DAYS / days
+    
+    rows: list[ModelCostRow] = []
+    total_usd = 0.0
+    total_credits = 0
+    
+    for row in token_rows:
+        raw_model = row.get("model_id") or row.get("model") or ""
+        prompt_obs = int(row.get("prompt_tokens", 0) or 0)
+        output_obs = int(row.get("output_tokens", 0) or 0)
+        cached_obs = int(row.get("cached_input_tokens", 0) or 0)
+        cache_write_obs = int(row.get("cache_write_tokens", 0) or 0)
+        
+        monthly_prompt = prompt_obs * scale
+        monthly_output = output_obs * scale
+        monthly_cached = cached_obs * scale
+        monthly_cache_write = cache_write_obs * scale
+        
+        pricing = get_model_pricing(raw_model)
+        if pricing is None:
+            rows.append(ModelCostRow(
+                model_id=raw_model,
+                display_name=_strip_prefix(raw_model) or "unknown",
+                provider="Unknown",
+                observed_prompt_tokens=prompt_obs,
+                observed_output_tokens=output_obs,
+                monthly_prompt_tokens=monthly_prompt,
+                monthly_output_tokens=monthly_output,
+                input_cost_usd=0.0,
+                output_cost_usd=0.0,
+                total_cost_usd=0.0,
+                monthly_credits=0,
+                cached_input_tokens=int(cached_obs),
+                billing_model="usage_based",
+            ))
+            continue
+        
+        # Calculate costs for each component
+        input_usd = (monthly_prompt / PER_TOKEN_UNIT) * pricing.input_per_million
+        output_usd = (monthly_output / PER_TOKEN_UNIT) * pricing.output_per_million
+        
+        # Cached input reads are cheaper (90% discount typical, varies by model)
+        cached_read_usd = (monthly_cached / PER_TOKEN_UNIT) * pricing.cached_input_per_million
+        
+        # Cache writes cost more (Anthropic models have explicit cache_write cost)
+        cache_write_usd = (monthly_cache_write / PER_TOKEN_UNIT) * pricing.cache_write_per_million if pricing.cache_write_per_million > 0 else 0.0
+        
+        row_usd = input_usd + output_usd + cached_read_usd + cache_write_usd
+        row_credits = math.ceil(row_usd / AI_CREDIT_USD_VALUE)
+        
+        total_usd += row_usd
+        total_credits += row_credits
+        
+        rows.append(ModelCostRow(
+            model_id=raw_model,
+            display_name=pricing.display_name,
+            provider=pricing.provider,
+            observed_prompt_tokens=prompt_obs,
+            observed_output_tokens=output_obs,
+            monthly_prompt_tokens=monthly_prompt,
+            monthly_output_tokens=monthly_output,
+            input_cost_usd=input_usd,
+            output_cost_usd=output_usd,
+            total_cost_usd=row_usd,
+            monthly_credits=row_credits,
+            cached_input_tokens=int(cached_obs),
+            cached_read_cost_usd=cached_read_usd,
+            cache_write_cost_usd=cache_write_usd,
+            billing_model="usage_based",
+        ))
+    
+    rows.sort(key=lambda r: r.total_cost_usd, reverse=True)
+    return CostSummary(
+        days_observed=days,
+        total_monthly_usd=total_usd,
+        total_monthly_credits=math.ceil(total_usd / AI_CREDIT_USD_VALUE),
+        rows=rows,
+    )
+
+
+def compute_monthly_cost_v2(
+    token_rows: list[dict],
+    days_observed: int,
+    billing_model: BillingModel = "usage_based",
+) -> CostSummary:
+    """Compute monthly cost, routing to the appropriate billing model calculator.
+    
+    Args:
+        token_rows: list of token usage dicts
+        days_observed: observation window in days
+        billing_model: "usage_based" (default, June 1 2026+) or 
+                       "request_based_legacy" (annual plans staying on old model)
+    
+    Returns:
+        :class:`CostSummary` with costs under the selected model.
+    """
+    if billing_model == "request_based_legacy":
+        return compute_monthly_cost_request_based(token_rows, days_observed)
+    else:  # usage_based (default)
+        # Check if rows have cached token data
+        has_cache_data = any(
+            row.get("cached_input_tokens", 0) or row.get("cache_write_tokens", 0)
+            for row in token_rows
+        )
+        if has_cache_data:
+            return compute_monthly_cost_with_cache(token_rows, days_observed)
+        else:
+            return compute_monthly_cost(token_rows, days_observed)
 
 
 def compute_plan_impact(
