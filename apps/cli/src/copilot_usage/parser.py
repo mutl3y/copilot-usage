@@ -10,6 +10,8 @@ from pathlib import Path
 
 from loguru import logger as log
 
+from . import token_calculator
+
 
 @lru_cache(maxsize=1)
 def _get_tokenizer():
@@ -425,3 +427,57 @@ def _handle_result(pf: ParsedFile, v: dict, request_index: int) -> None:
         tool_call_rounds=tool_rounds,
     )
     pf.requests.append(event)
+
+
+def calculate_tokens_from_session_events(
+    session_id: str,
+    session_dir: Path | None = None,
+) -> RequestEvent | None:
+    """Calculate token usage from session-state events as fallback.
+
+    When normal JSONL parsing yields zero requests, attempt to extract usage
+    metrics from ~/.copilot/session-state/{session_id}/events.jsonl using the
+    token calculator module.
+
+    Returns:
+        RequestEvent with aggregated tokens, or None if calculation fails.
+    """
+    if session_dir is None:
+        session_dir = Path.home() / ".copilot" / "session-state" / session_id
+
+    if not session_dir.exists():
+        log.debug(f"Session directory not found for fallback: {session_dir}")
+        return None
+
+    try:
+        calc = token_calculator.SessionTokenCalculator(session_dir)
+        estimate = calc.calculate_session_usage()
+
+        if estimate.total_tokens == 0:
+            log.debug(f"No token data in session {session_id}")
+            return None
+
+        # Convert TokenUsageEstimate to RequestEvent
+        # Use aggregated counts as a single request (conservative approach)
+        event = RequestEvent(
+            chat_session_id=session_id,
+            request_index=0,
+            model_id=f"copilot/{estimate.model}" if estimate.model != "unknown" else None,
+            timestamp_ms=None,  # Will be filled by caller if available
+            prompt_tokens=estimate.user_tokens,
+            output_tokens=estimate.assistant_tokens,
+            tool_call_rounds=0,  # We count tool overhead in tokens instead
+            tokens_estimated=True,
+        )
+        # Add tool overhead to output tokens (conservative estimate)
+        event.output_tokens += estimate.tool_overhead_tokens
+
+        log.info(
+            f"Fallback token calculation for {session_id}: "
+            f"{event.prompt_tokens} in + {event.output_tokens} out = {event.prompt_tokens + event.output_tokens} total"
+        )
+        return event
+
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Failed to calculate tokens from session {session_id}: {e}")
+        return None

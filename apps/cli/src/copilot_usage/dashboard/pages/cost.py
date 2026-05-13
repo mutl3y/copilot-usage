@@ -12,8 +12,10 @@ import copilot_usage.dashboard.queries as queries
 from copilot_usage.dashboard.app import empty_fig
 from copilot_usage.pricing import (
     PLAN_ALLOWANCES,
+    BillingModel,
     CopilotPlan,
     compute_monthly_cost,
+    compute_monthly_cost_v2,
     compute_plan_impact,
     compute_trend,
 )
@@ -31,6 +33,11 @@ WINDOW_OPTIONS = [
 ]
 
 PLAN_OPTIONS = [{"label": a.display_name, "value": k} for k, a in PLAN_ALLOWANCES.items()]
+
+BILLING_MODEL_OPTIONS = [
+    {"label": "Usage-Based (June 1, 2026+)", "value": "usage_based"},
+    {"label": "Request-Based Legacy (Annual Plans)", "value": "request_based_legacy"},
+]
 
 # ---------------------------------------------------------------------------
 # Layout helpers
@@ -51,9 +58,20 @@ def _kpi_card(title: str, value_id: str, sub_id: str | None = None, color: str =
 
 def _plan_select():
     return html.Div([
-        html.Div("Plan Settings", className="card-header"),
+        html.Div("Billing Model & Plan Settings", className="card-header"),
         html.Div([
+            # Billing model selector (radio buttons)
             dbc.Row([
+                dbc.Col([
+                    html.Label("Billing Model", className="settings-label"),
+                    dcc.RadioItems(
+                        id="cost-billing-model",
+                        options=BILLING_MODEL_OPTIONS,
+                        value="usage_based",
+                        className="theme-radio",
+                        labelStyle={"display": "block", "marginBottom": "0.5rem"},
+                    ),
+                ], md=4),
                 dbc.Col([
                     html.Label("Copilot Plan", className="settings-label"),
                     dcc.Dropdown(
@@ -73,7 +91,9 @@ def _plan_select():
                         clearable=False,
                         className="theme-dropdown",
                     ),
-                ], md=3),
+                ], md=4),
+            ]),
+            dbc.Row([
                 dbc.Col([
                     html.Label("Extra Budget (USD/month)", className="settings-label"),
                     dbc.Input(
@@ -94,8 +114,8 @@ def _plan_select():
                     ),
                     html.Span("", id="cost-save-msg", className="ms-2 text-success",
                               style={"fontSize": ".8rem"}),
-                ], md=2, className="d-flex align-items-end gap-2"),
-            ]),
+                ], md=3, className="d-flex align-items-end gap-2"),
+            ], className="mt-3"),
         ], className="p-3"),
     ], className="section-card mb-4")
 
@@ -165,30 +185,34 @@ def _load_cost_data(days: int):
 
 
 @callback(
+    Output("cost-billing-model", "value"),
     Output("cost-plan-select",   "value"),
     Output("cost-extra-budget",  "value"),
     Input("cost-window-select",  "value"),   # triggers on load
     prevent_initial_call=False,
 )
 def _load_saved_settings(_):
-    """Restore persisted plan + budget from DB."""
+    """Restore persisted billing model, plan + budget from DB."""
+    model = queries.get_cost_setting("cost.billing_model", "usage_based")
     plan  = queries.get_cost_setting("cost.plan", "pro")
     budget = queries.get_cost_setting("cost.extra_budget_usd", "0")
     try:
         budget_val = float(budget)
     except (ValueError, TypeError):
         budget_val = 0.0
-    return plan, budget_val
+    return model, plan, budget_val
 
 
 @callback(
     Output("cost-save-msg", "children"),
     Input("cost-save-btn", "n_clicks"),
+    State("cost-billing-model", "value"),
     State("cost-plan-select", "value"),
     State("cost-extra-budget", "value"),
     prevent_initial_call=True,
 )
-def _save_settings(_, plan: str, budget):
+def _save_settings(_, model: str, plan: str, budget):
+    queries.save_cost_setting("cost.billing_model", model or "usage_based")
     queries.save_cost_setting("cost.plan", plan or "pro")
     queries.save_cost_setting("cost.extra_budget_usd", str(budget or 0))
     return "Saved"
@@ -206,11 +230,12 @@ def _save_settings(_, plan: str, budget):
     Output("cost-table-container",  "children"),
     Output("cost-pie",              "figure"),
     Input("cost-data-store",        "data"),
+    Input("cost-billing-model",     "value"),
     Input("cost-plan-select",       "value"),
     Input("cost-extra-budget",      "value"),
     prevent_initial_call=False,
 )
-def _render_cost(store, plan_id: str, extra_budget):
+def _render_cost(store, billing_model: str, plan_id: str, extra_budget):
     if not store:
         empty = empty_fig()
         return ("—", "", "—", "", "—", "—", None, None, html.P("No data."), empty)
@@ -221,8 +246,9 @@ def _render_cost(store, plan_id: str, extra_budget):
 
     extra_usd = float(extra_budget or 0)
     plan_id = plan_id or "pro"
+    billing_model = billing_model or "usage_based"
 
-    summary = compute_monthly_cost(rows, days_observed=days)
+    summary = compute_monthly_cost_v2(rows, days_observed=days, billing_model=billing_model)
     impact  = compute_plan_impact(summary, plan_id, extra_usd)
 
     # ── KPIs ────────────────────────────────────────────────────────────────

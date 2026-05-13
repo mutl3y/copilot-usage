@@ -11,6 +11,13 @@ import platform
 
 def _default_vscode_storage() -> pathlib.Path:
     sys = platform.system()
+
+    # Check for remote SSH VS Code server first (Linux only)
+    if sys == "Linux":
+        vscode_server_path = pathlib.Path.home() / ".vscode-server" / "data" / "User" / "workspaceStorage"
+        if vscode_server_path.exists():
+            return vscode_server_path
+
     if sys == "Windows":
         base = pathlib.Path(os.environ.get("APPDATA", "") or str(pathlib.Path.home() / "AppData" / "Roaming"))
     elif sys == "Darwin":
@@ -28,11 +35,13 @@ VSCODE_STORAGE_ROOT = _default_vscode_storage()
 
 def _default_app_data() -> pathlib.Path:
     sys = platform.system()
-    if sys == "Windows":
-        base = pathlib.Path(os.environ.get("LOCALAPPDATA", "") or str(pathlib.Path.home() / "AppData" / "Local"))
-    elif sys == "Darwin":
-        base = pathlib.Path.home() / "Library" / "Application Support"
-    else:
+
+    # Check for remote SSH VS Code server first (Linux only)
+    if sys == "Linux":
+        vscode_global_storage = pathlib.Path.home() / ".vscode-server" / "data" / "User" / "globalStorage"
+        if vscode_global_storage.exists():
+            return vscode_global_storage / "copilot-usage"
+    
         base = pathlib.Path(os.environ.get("XDG_DATA_HOME", "") or str(pathlib.Path.home() / ".local" / "share"))
     return base / "copilot-usage"
 

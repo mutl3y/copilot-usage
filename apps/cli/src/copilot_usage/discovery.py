@@ -9,6 +9,7 @@ import duckdb
 from loguru import logger as log
 
 from copilot_usage.config import VSCODE_STORAGE_ROOT
+from copilot_usage import debug_logs_parser
 
 
 def _uri_to_path(uri: str) -> str:
@@ -92,17 +93,38 @@ def discover_all_session_files(
     for workspace_dir in root.iterdir():
         if not workspace_dir.is_dir():
             continue
-        sessions_dir = workspace_dir / "chatSessions"
-        if not sessions_dir.is_dir():
-            continue
         workspace_id, workspace_path = resolve_workspace(workspace_dir)
-        for f in sessions_dir.iterdir():
-            if not f.is_file():
+        
+        # Check both legacy chatSessions and new GitHub.copilot-chat/debug-logs structure
+        sessions_dirs = [
+            workspace_dir / "chatSessions",  # legacy
+            workspace_dir / "GitHub.copilot-chat" / "debug-logs",  # current
+        ]
+        
+        for sessions_dir in sessions_dirs:
+            if not sessions_dir.is_dir():
                 continue
-            if f.suffix == ".jsonl":
-                jsonl_results.append((workspace_id, workspace_path, f))
-            elif f.suffix == ".json":
-                legacy_results.append((workspace_id, workspace_path, f))
+            # For GitHub.copilot-chat, descend into session ID directories
+            if "GitHub.copilot-chat" in str(sessions_dir):
+                for session_dir in sessions_dir.iterdir():
+                    if not session_dir.is_dir():
+                        continue
+                    for f in session_dir.iterdir():
+                        if not f.is_file():
+                            continue
+                        if f.suffix == ".jsonl":
+                            jsonl_results.append((workspace_id, workspace_path, f))
+                        elif f.suffix == ".json":
+                            legacy_results.append((workspace_id, workspace_path, f))
+            else:
+                # Legacy chatSessions directory has files directly
+                for f in sessions_dir.iterdir():
+                    if not f.is_file():
+                        continue
+                    if f.suffix == ".jsonl":
+                        jsonl_results.append((workspace_id, workspace_path, f))
+                    elif f.suffix == ".json":
+                        legacy_results.append((workspace_id, workspace_path, f))
 
     log.info(
         "Discovered {} JSONL + {} legacy JSON files across {} workspaces",
@@ -177,22 +199,33 @@ def update_file_index(
     deleted_paths: set[str],
     scan_id: int,
 ) -> None:
-    """Upsert file_index after a scan."""
-    for p in parsed_files:
+    """Upsert file_index after a scan.
+    
+    Deduplicates file paths to avoid PRIMARY KEY constraint violations.
+    """
+    # Deduplicate paths (convert to set of strings, then back to unique Paths)
+    unique_paths = {str(p): p for p in parsed_files}.values()
+    
+    for p in unique_paths:
         try:
             stat = p.stat()
         except OSError:
             continue
+        # Use INSERT OR IGNORE instead of ON CONFLICT for better compatibility
+        # If file already exists, skip (mtime check below handles updates)
         con.execute(
-            """INSERT INTO file_index (file_path, file_size, file_mtime, last_scan_id)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT (file_path) DO UPDATE SET
-                   file_size = excluded.file_size,
-                   file_mtime = excluded.file_mtime,
-                   last_scan_id = excluded.last_scan_id,
-                   deleted = FALSE""",
+            """INSERT OR IGNORE INTO file_index (file_path, file_size, file_mtime, last_scan_id, deleted)
+               VALUES (?, ?, ?, ?, FALSE)""",
             [str(p), stat.st_size, stat.st_mtime, scan_id],
         )
+        # Now update if mtime changed (file was re-scanned)
+        con.execute(
+            """UPDATE file_index 
+               SET file_size = ?, file_mtime = ?, last_scan_id = ?, deleted = FALSE
+               WHERE file_path = ? AND file_mtime != ?""",
+            [stat.st_size, stat.st_mtime, scan_id, str(p), stat.st_mtime],
+        )
+    
     for dp in deleted_paths:
         con.execute(
             "UPDATE file_index SET deleted = TRUE, last_scan_id = ? WHERE file_path = ?",

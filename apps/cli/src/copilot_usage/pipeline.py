@@ -16,7 +16,8 @@ from copilot_usage.discovery import (
     update_file_index,
 )
 from copilot_usage.ingest import ingest_parsed_file
-from copilot_usage.parser import parse_jsonl, parse_legacy_json
+from copilot_usage.parser import parse_jsonl, parse_legacy_json, calculate_tokens_from_session_events
+from copilot_usage import debug_logs_parser
 
 ProgressCallback = Callable[[str, float | None], None]  # (message, progress_pct)
 
@@ -103,16 +104,108 @@ def run_scan(
             parsed_paths.append(path)
             affected_ws.add(ws_id)
 
+    # 5b. Fallback: if normal parsing yielded zero events, try token calculator
+    if total_events == 0 and len(all_jsonl) > 0:
+        _emit("No events found; attempting fallback token calculation…", 70)
+        try:
+            from pathlib import Path
+
+            session_state_dir = Path.home() / ".copilot" / "session-state"
+            if session_state_dir.exists():
+                for session_dir in session_state_dir.iterdir():
+                    if not session_dir.is_dir():
+                        continue
+                    session_id = session_dir.name
+                    event = calculate_tokens_from_session_events(session_id, session_dir)
+                    if event:
+                        # Create a minimal ParsedFile to ingest the fallback event
+                        from copilot_usage.parser import ParsedFile
+
+                        pf = ParsedFile(
+                            source_path=session_dir / "events.jsonl",
+                            workspace_id="",  # Will be backfilled
+                            workspace_path="",
+                            data_source="session_state_fallback",
+                        )
+                        pf.anchor = None
+                        pf.requests = [event]
+                        n = ingest_parsed_file(con, pf)
+                        total_events += n
+                        affected_ws.add("")  # Mark for aggregate rebuild
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"Fallback token calculation failed: {e}")
+
+    # 5c. Ingest from debug-logs (actual API call metrics)
+    _emit("Scanning debug-logs for actual usage metrics…", 75)
+    try:
+        from copilot_usage.parser import RequestEvent, ParsedFile
+
+        debug_log_files = debug_logs_parser.discover_debug_log_files(storage_root)
+        if debug_log_files:
+            events_from_debug = 0
+            
+            # Batch requests by file to avoid deleting within same file
+            for workspace_id, session_id, file_path in debug_log_files:
+                file_requests = []
+                request_counter = 0
+                
+                for request in debug_logs_parser.parse_debug_log_file(
+                    file_path, workspace_id, session_id
+                ):
+                    # Convert debug-log request to RequestEvent format
+                    # Use a unique index per request in this file
+                    event = RequestEvent(
+                        chat_session_id=request.session_id,
+                        request_index=request_counter,  # Counter ensures uniqueness
+                        request_id=request.request_id,  # Preserve the spanId
+                        model_id=f"copilot/{request.model}",
+                        timestamp_ms=request.timestamp_ms,
+                        prompt_tokens=request.input_tokens,
+                        output_tokens=request.output_tokens,
+                        tool_call_rounds=0,
+                        tokens_estimated=False,  # These are actual tokens!
+                    )
+                    file_requests.append(event)
+                    request_counter += 1
+                
+                # Ingest all requests from this file in one batch
+                if file_requests:
+                    pf = ParsedFile(
+                        source_path=file_path,
+                        workspace_id=workspace_id,
+                        workspace_path="",  # Not available from debug-logs
+                        data_source="debug_logs",
+                    )
+                    pf.anchor = None
+                    pf.requests = file_requests
+                    n = ingest_parsed_file(con, pf)
+                    total_events += n
+                    events_from_debug += len(file_requests)
+                    affected_ws.add(workspace_id)
+
+                    # Update progress occasionally
+                    if events_from_debug % 500 == 0:
+                        pct = 75 + ((events_from_debug / 10000) * 5)  # 75% → 80%
+                        _emit(
+                            f"Ingesting debug-log events… ({events_from_debug:,})",
+                            pct,
+                        )
+
+            if events_from_debug > 0:
+                _emit(f"  Ingested {events_from_debug:,} events from debug-logs", 80)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Debug-logs ingest failed: {e}")
+
     # 6. Update file index
-    _emit("Updating file index…", 82)
+    _emit("Updating file index…", 85)
     update_file_index(con, parsed_paths, deleted, scan_id)
 
     # 7. Rebuild aggregates (incremental when possible)
-    _emit("Rebuilding aggregates…", 88)
+    _emit("Rebuilding aggregates…", 90)
     rebuild_aggregates(con, affected_ws or None)
 
     # 8. Export badges
-    _emit("Exporting badges…", 94)
+    _emit("Exporting badges…", 96)
     export_badges(con)
 
     # 9. Finalize scan run

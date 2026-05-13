@@ -24,16 +24,57 @@ layout = html.Div([
     dcc.Store(id="ov-trigger"),
     dcc.Interval(id="ov-init",    interval=300,    max_intervals=1),
     dcc.Interval(id="ov-refresh", interval=30_000),
+    
+    # Control bar: refresh, date range, metric toggle, overlay toggle
     dbc.Row(
         dbc.Col(
             html.Div(
-                dbc.Button(
-                    [html.I(className="bi bi-arrow-clockwise me-1"), "Refresh"],
-                    id="ov-refresh-btn",
-                    color="secondary", outline=True, size="sm",
-                ),
-                className="d-flex justify-content-end mb-2",
-            )
+                [
+                    dbc.Button(
+                        [html.I(className="bi bi-arrow-clockwise me-1"), "Refresh"],
+                        id="ov-refresh-btn",
+                        color="secondary", outline=True, size="sm",
+                        className="me-2",
+                    ),
+                    html.Span("Date Range:", className="ms-3 me-2", style={"fontSize": "0.9rem"}),
+                    dcc.Dropdown(
+                        id="ov-date-range",
+                        options=[
+                            {"label": "7 days", "value": 7},
+                            {"label": "30 days", "value": 30},
+                            {"label": "90 days", "value": 90},
+                            {"label": "6 months", "value": 180},
+                            {"label": "1 year", "value": 365},
+                            {"label": "All-time", "value": -1},
+                        ],
+                        value=30,
+                        clearable=False,
+                        searchable=False,
+                        style={"width": "120px", "display": "inline-block"},
+                    ),
+                    html.Span("Metric:", className="ms-3 me-2", style={"fontSize": "0.9rem"}),
+                    dcc.RadioItems(
+                        id="ov-metric",
+                        options=[
+                            {"label": " Tokens", "value": "tokens"},
+                            {"label": " Requests", "value": "requests"},
+                        ],
+                        value="tokens",
+                        inline=True,
+                        style={"display": "inline-block", "marginRight": "2rem"},
+                    ),
+                    dcc.Checklist(
+                        id="ov-overlay",
+                        options=[{"label": " Show Billing Comparison Overlay", "value": "overlay"}],
+                        value=[],
+                        inline=True,
+                        style={"display": "inline-block"},
+                    ),
+                ],
+                className="d-flex align-items-center flex-wrap",
+                style={"gap": "1rem"},
+            ),
+            className="d-flex justify-content-start mb-2",
         )
     ),
 
@@ -44,7 +85,7 @@ layout = html.Div([
     dbc.Row([
         dbc.Col(
             html.Div([
-                html.Div("Daily Token Usage", className="card-header"),
+                html.Div("Daily Usage Trends", className="card-header"),
                 dcc.Graph(id="ov-timeline", config={"displayModeBar": False}),
             ], className="section-card"),
             lg=8,
@@ -156,23 +197,107 @@ def _kpis(_):
     return cards + [source_bar]
 
 
-@callback(Output("ov-timeline", "figure"), Input("ov-trigger", "data"))
-def _timeline(_):
-    rows = queries.daily_timeseries()
-    if not rows:
-        return empty_fig("No data yet")
-    df = pd.DataFrame(rows)
-    df["model_short"] = df["model"].str.replace("copilot/", "", regex=False)
-    fig = px.bar(
-        df, x="date", y="prompt_tokens", color="model_short",
-        labels={"prompt_tokens": "Prompt Tokens", "date": "", "model_short": "Model"},
-        color_discrete_sequence=px.colors.qualitative.Set2,
-    )
+@callback(Output("ov-timeline", "figure"), 
+          Input("ov-trigger", "data"),
+          Input("ov-date-range", "value"),
+          Input("ov-metric", "value"),
+          Input("ov-overlay", "value"))
+def _timeline(_, days, metric, overlay_list):
+    """Build timeline chart with configurable date range and metrics.
+    
+    When overlay is enabled, shows side-by-side bars:
+    - Historic (left): Usage-based billing cost
+    - Predicted (right): Request-based billing cost
+    """
+    days = days or 30  # Default to 30 if not set
+    overlay_enabled = "overlay" in (overlay_list or [])
+    metric = metric or "tokens"  # Default to tokens if not set
+    
+    if metric == "requests":
+        # Premium request counts
+        rows = queries.daily_requests_by_model(days)
+        if not rows:
+            return empty_fig("No data yet")
+        df = pd.DataFrame(rows)
+        df["model_short"] = df["model"].str.replace("copilot/", "", regex=False)
+        
+        if not overlay_enabled:
+            # Simple stacked bar by model
+            fig = px.bar(
+                df, x="date", y="requests", color="model_short",
+                labels={"requests": "Premium Requests", "date": "", "model_short": "Model"},
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
+        else:
+            # Side-by-side: historic vs predicted billing costs
+            cost_rows = queries.daily_costs_by_billing_model(days)
+            if not cost_rows:
+                return empty_fig("No billing data")
+            cost_df = pd.DataFrame(cost_rows)
+            
+            fig = go.Figure()
+            # Historic (usage-based, left bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["usage_based_cost"],
+                name="Historic (Usage-Based)",
+                marker_color="rgba(88, 166, 255, 0.8)",
+                offsetgroup=0,
+            ))
+            # Predicted (request-based, right bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["request_based_cost"],
+                name="Predicted (Request-Based)",
+                marker_color="rgba(210, 153, 34, 0.8)",
+                offsetgroup=1,
+            ))
+    else:
+        # Token usage
+        rows = queries.daily_timeseries_range(days)
+        if not rows:
+            return empty_fig("No data yet")
+        df = pd.DataFrame(rows)
+        df["model_short"] = df["model"].str.replace("copilot/", "", regex=False)
+        
+        if not overlay_enabled:
+            # Simple stacked bar by model
+            fig = px.bar(
+                df, x="date", y="prompt_tokens", color="model_short",
+                labels={"prompt_tokens": "Prompt Tokens", "date": "", "model_short": "Model"},
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
+        else:
+            # Side-by-side: historic vs predicted billing costs
+            cost_rows = queries.daily_costs_by_billing_model(days)
+            if not cost_rows:
+                return empty_fig("No billing data")
+            cost_df = pd.DataFrame(cost_rows)
+            
+            fig = go.Figure()
+            # Historic (usage-based, left bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["usage_based_cost"],
+                name="Historic (Usage-Based)",
+                marker_color="rgba(88, 166, 255, 0.8)",
+                offsetgroup=0,
+            ))
+            # Predicted (request-based, right bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["request_based_cost"],
+                name="Predicted (Request-Based)",
+                marker_color="rgba(210, 153, 34, 0.8)",
+                offsetgroup=1,
+            ))
+
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=10, b=30, l=60, r=10),
+        hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         bargap=0.15,
         xaxis=dict(gridcolor="rgba(48,54,61,.5)"),

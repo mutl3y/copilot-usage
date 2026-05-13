@@ -449,3 +449,140 @@ def save_cost_setting(key: str, value: str) -> None:
     con = _con()
     set_setting(con, key, value)
     invalidate_cache()
+
+
+# ---------------------------------------------------------------------------
+# Overview dashboard (time-series with flexible date ranges)
+# ---------------------------------------------------------------------------
+
+def daily_timeseries_range(days: int = 30) -> list[dict]:
+    """Daily token usage over configurable date range (7, 30, 90, 180, 365 days or all-time).
+    
+    Args:
+        days: Number of trailing days (or -1 for all-time)
+    
+    Returns:
+        List of dicts: {date, model, requests, prompt_tokens, output_tokens, premium}
+    """
+    con = _con()
+    if days == -1:
+        date_filter = "1=1"  # all-time
+    else:
+        date_filter = f"agg_date >= CURRENT_DATE - INTERVAL '{int(days)} days'"
+    
+    rows = con.execute(f"""
+        SELECT agg_date, model_id,
+               request_count, prompt_tokens, output_tokens, premium_estimate
+        FROM agg_daily
+        WHERE {date_filter}
+        ORDER BY agg_date
+    """).fetchall()
+    return [
+        {
+            "date": str(r[0]),
+            "model": r[1],
+            "requests": r[2],
+            "prompt_tokens": r[3],
+            "output_tokens": r[4],
+            "premium": r[5],
+        }
+        for r in rows
+    ]
+
+
+def daily_requests_by_model(days: int = 30) -> list[dict]:
+    """Daily premium request counts by model (for request-based view).
+    
+    Args:
+        days: Number of trailing days (or -1 for all-time)
+    
+    Returns:
+        List of dicts: {date, model, requests, premium_estimate}
+    """
+    con = _con()
+    if days == -1:
+        date_filter = "1=1"  # all-time
+    else:
+        date_filter = f"agg_date >= CURRENT_DATE - INTERVAL '{int(days)} days'"
+    
+    rows = con.execute(f"""
+        SELECT agg_date, model_id, request_count, premium_estimate
+        FROM agg_daily
+        WHERE {date_filter}
+        ORDER BY agg_date, model_id
+    """).fetchall()
+    return [
+        {
+            "date": str(r[0]),
+            "model": r[1],
+            "requests": r[2],
+            "premium": r[3],
+        }
+        for r in rows
+    ]
+
+
+def daily_costs_by_billing_model(days: int = 30) -> list[dict]:
+    """Daily costs under both billing models for overlay comparison.
+    
+    For usage-based: sum(prompt_tokens * 0.0003 + output_tokens * 0.0012 + cached * 0.00015)
+    For request-based: count(requests) * 0.5 * model_multiplier
+    
+    Returns per-day totals for both models.
+    
+    Args:
+        days: Number of trailing days (or -1 for all-time)
+    
+    Returns:
+        List of dicts: {date, usage_based_cost, request_based_cost}
+    """
+    con = _con()
+    if days == -1:
+        date_filter = "1=1"
+    else:
+        date_filter = f"agg_date >= CURRENT_DATE - INTERVAL '{int(days)} days'"
+    
+    # Get daily aggregated data
+    rows = con.execute(f"""
+        SELECT agg_date,
+               SUM(prompt_tokens) AS total_prompt,
+               SUM(output_tokens) AS total_output,
+               SUM(request_count) AS total_requests,
+               COUNT(DISTINCT model_id) AS model_count
+        FROM agg_daily
+        WHERE {date_filter}
+        GROUP BY agg_date
+        ORDER BY agg_date
+    """).fetchall()
+    
+    # For request-based, we need model-wise breakdown to apply correct multipliers
+    model_rows = con.execute(f"""
+        SELECT agg_date, model_id, request_count
+        FROM agg_daily
+        WHERE {date_filter}
+        ORDER BY agg_date, model_id
+    """).fetchall()
+    
+    # Build model multiplier lookup
+    from copilot_usage.pricing import get_model_multiplier
+    
+    # Calculate usage-based costs (simple per-token rates)
+    result = {}
+    for r in rows:
+        date = str(r[0])
+        # Usage-based: $0.0003/prompt, $0.0012/output (simplified; no cache)
+        usage_cost = (r[1] or 0) * 0.0003 + (r[2] or 0) * 0.0012
+        result[date] = {"date": date, "usage_based_cost": usage_cost, "request_based_cost": 0.0}
+    
+    # Add request-based costs
+    for r in model_rows:
+        date = str(r[0])
+        model = r[1] or "unknown"
+        reqs = r[2] or 0
+        multiplier = get_model_multiplier(model)
+        # Request-based: $0.50/request * model_multiplier
+        request_cost = reqs * 0.50 * multiplier
+        if date in result:
+            result[date]["request_based_cost"] += request_cost
+    
+    return sorted(result.values(), key=lambda x: x["date"])
