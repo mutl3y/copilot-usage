@@ -203,163 +203,101 @@ def _kpis(_):
           Input("ov-metric", "value"),
           Input("ov-overlay", "value"))
 def _timeline(_, days, metric, overlay_list):
+    """Build timeline chart with configurable date range and metrics.
+    
+    When overlay is enabled, shows side-by-side bars:
+    - Historic (left): Usage-based billing cost
+    - Predicted (right): Request-based billing cost
+    """
+    days = days or 30  # Default to 30 if not set
     overlay_enabled = "overlay" in (overlay_list or [])
+    metric = metric or "tokens"  # Default to tokens if not set
     
     if metric == "requests":
-        # Show premium request counts by model
+        # Premium request counts
         rows = queries.daily_requests_by_model(days)
         if not rows:
             return empty_fig("No data yet")
         df = pd.DataFrame(rows)
         df["model_short"] = df["model"].str.replace("copilot/", "", regex=False)
         
-        if overlay_enabled:
-            # Overlay: show requests and cost comparison
+        if not overlay_enabled:
+            # Simple stacked bar by model
+            fig = px.bar(
+                df, x="date", y="requests", color="model_short",
+                labels={"requests": "Premium Requests", "date": "", "model_short": "Model"},
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
+        else:
+            # Side-by-side: historic vs predicted billing costs
             cost_rows = queries.daily_costs_by_billing_model(days)
-            if cost_rows:
-                cost_df = pd.DataFrame(cost_rows)
-                fig = go.Figure()
-                
-                # Primary axis: requests by model
-                for model in df["model_short"].unique():
-                    model_data = df[df["model_short"] == model].sort_values("date")
-                    fig.add_trace(go.Bar(
-                        x=model_data["date"],
-                        y=model_data["requests"],
-                        name=f"{model} (requests)",
-                        yaxis="y",
-                    ))
-                
-                # Secondary axis: billing model costs
-                fig.add_trace(go.Scatter(
-                    x=cost_df["date"],
-                    y=cost_df["usage_based_cost"],
-                    name="Cost: Usage-Based",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="rgba(88, 166, 255, 0.8)", width=2, dash="solid"),
-                ))
-                fig.add_trace(go.Scatter(
-                    x=cost_df["date"],
-                    y=cost_df["request_based_cost"],
-                    name="Cost: Request-Based",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="rgba(210, 153, 34, 0.8)", width=2, dash="dash"),
-                ))
-                
-                fig.update_layout(
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(t=10, b=30, l=60, r=80),
-                    hovermode="x unified",
-                    yaxis=dict(
-                        title="Requests",
-                        gridcolor="rgba(48,54,61,.5)",
-                    ),
-                    yaxis2=dict(
-                        title="Daily Cost ($)",
-                        overlaying="y",
-                        side="right",
-                    ),
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1,
-                    ),
-                )
-                return fig
-        
-        # Regular requests view (no overlay)
-        fig = px.bar(
-            df, x="date", y="requests", color="model_short",
-            labels={"requests": "Premium Requests", "date": "", "model_short": "Model"},
-            color_discrete_sequence=px.colors.qualitative.Set2,
-        )
+            if not cost_rows:
+                return empty_fig("No billing data")
+            cost_df = pd.DataFrame(cost_rows)
+            
+            fig = go.Figure()
+            # Historic (usage-based, left bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["usage_based_cost"],
+                name="Historic (Usage-Based)",
+                marker_color="rgba(88, 166, 255, 0.8)",
+                offsetgroup=0,
+            ))
+            # Predicted (request-based, right bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["request_based_cost"],
+                name="Predicted (Request-Based)",
+                marker_color="rgba(210, 153, 34, 0.8)",
+                offsetgroup=1,
+            ))
     else:
-        # Show token usage by model
+        # Token usage
         rows = queries.daily_timeseries_range(days)
         if not rows:
             return empty_fig("No data yet")
         df = pd.DataFrame(rows)
         df["model_short"] = df["model"].str.replace("copilot/", "", regex=False)
         
-        if overlay_enabled:
-            # Overlay: show token usage and cost comparison
+        if not overlay_enabled:
+            # Simple stacked bar by model
+            fig = px.bar(
+                df, x="date", y="prompt_tokens", color="model_short",
+                labels={"prompt_tokens": "Prompt Tokens", "date": "", "model_short": "Model"},
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
+        else:
+            # Side-by-side: historic vs predicted billing costs
             cost_rows = queries.daily_costs_by_billing_model(days)
-            if cost_rows:
-                cost_df = pd.DataFrame(cost_rows)
-                fig = go.Figure()
-                
-                # Primary axis: tokens by model
-                for model in df["model_short"].unique():
-                    model_data = df[df["model_short"] == model].sort_values("date")
-                    total_tokens = model_data["prompt_tokens"] + model_data["output_tokens"]
-                    fig.add_trace(go.Bar(
-                        x=model_data["date"],
-                        y=total_tokens,
-                        name=f"{model} (tokens)",
-                        yaxis="y",
-                    ))
-                
-                # Secondary axis: billing model costs
-                fig.add_trace(go.Scatter(
-                    x=cost_df["date"],
-                    y=cost_df["usage_based_cost"],
-                    name="Cost: Usage-Based",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="rgba(88, 166, 255, 0.8)", width=2, dash="solid"),
-                ))
-                fig.add_trace(go.Scatter(
-                    x=cost_df["date"],
-                    y=cost_df["request_based_cost"],
-                    name="Cost: Request-Based",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="rgba(210, 153, 34, 0.8)", width=2, dash="dash"),
-                ))
-                
-                fig.update_layout(
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(t=10, b=30, l=60, r=80),
-                    hovermode="x unified",
-                    yaxis=dict(
-                        title="Total Tokens",
-                        gridcolor="rgba(48,54,61,.5)",
-                    ),
-                    yaxis2=dict(
-                        title="Daily Cost ($)",
-                        overlaying="y",
-                        side="right",
-                    ),
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1,
-                    ),
-                )
-                return fig
-        
-        # Regular token view (no overlay)
-        fig = px.bar(
-            df, x="date", y="prompt_tokens", color="model_short",
-            labels={"prompt_tokens": "Prompt Tokens", "date": "", "model_short": "Model"},
-            color_discrete_sequence=px.colors.qualitative.Set2,
-        )
+            if not cost_rows:
+                return empty_fig("No billing data")
+            cost_df = pd.DataFrame(cost_rows)
+            
+            fig = go.Figure()
+            # Historic (usage-based, left bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["usage_based_cost"],
+                name="Historic (Usage-Based)",
+                marker_color="rgba(88, 166, 255, 0.8)",
+                offsetgroup=0,
+            ))
+            # Predicted (request-based, right bars)
+            fig.add_trace(go.Bar(
+                x=cost_df["date"],
+                y=cost_df["request_based_cost"],
+                name="Predicted (Request-Based)",
+                marker_color="rgba(210, 153, 34, 0.8)",
+                offsetgroup=1,
+            ))
 
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=10, b=30, l=60, r=10),
+        hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         bargap=0.15,
         xaxis=dict(gridcolor="rgba(48,54,61,.5)"),
