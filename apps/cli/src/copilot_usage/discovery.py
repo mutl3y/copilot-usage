@@ -199,22 +199,33 @@ def update_file_index(
     deleted_paths: set[str],
     scan_id: int,
 ) -> None:
-    """Upsert file_index after a scan."""
-    for p in parsed_files:
+    """Upsert file_index after a scan.
+    
+    Deduplicates file paths to avoid PRIMARY KEY constraint violations.
+    """
+    # Deduplicate paths (convert to set of strings, then back to unique Paths)
+    unique_paths = {str(p): p for p in parsed_files}.values()
+    
+    for p in unique_paths:
         try:
             stat = p.stat()
         except OSError:
             continue
+        # Use INSERT OR IGNORE instead of ON CONFLICT for better compatibility
+        # If file already exists, skip (mtime check below handles updates)
         con.execute(
-            """INSERT INTO file_index (file_path, file_size, file_mtime, last_scan_id)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT (file_path) DO UPDATE SET
-                   file_size = excluded.file_size,
-                   file_mtime = excluded.file_mtime,
-                   last_scan_id = excluded.last_scan_id,
-                   deleted = FALSE""",
+            """INSERT OR IGNORE INTO file_index (file_path, file_size, file_mtime, last_scan_id, deleted)
+               VALUES (?, ?, ?, ?, FALSE)""",
             [str(p), stat.st_size, stat.st_mtime, scan_id],
         )
+        # Now update if mtime changed (file was re-scanned)
+        con.execute(
+            """UPDATE file_index 
+               SET file_size = ?, file_mtime = ?, last_scan_id = ?, deleted = FALSE
+               WHERE file_path = ? AND file_mtime != ?""",
+            [stat.st_size, stat.st_mtime, scan_id, str(p), stat.st_mtime],
+        )
+    
     for dp in deleted_paths:
         con.execute(
             "UPDATE file_index SET deleted = TRUE, last_scan_id = ? WHERE file_path = ?",
