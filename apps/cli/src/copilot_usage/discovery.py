@@ -9,6 +9,7 @@ import duckdb
 from loguru import logger as log
 
 from copilot_usage.config import VSCODE_STORAGE_ROOT
+from copilot_usage import debug_logs_parser
 
 
 def _uri_to_path(uri: str) -> str:
@@ -92,17 +93,38 @@ def discover_all_session_files(
     for workspace_dir in root.iterdir():
         if not workspace_dir.is_dir():
             continue
-        sessions_dir = workspace_dir / "chatSessions"
-        if not sessions_dir.is_dir():
-            continue
         workspace_id, workspace_path = resolve_workspace(workspace_dir)
-        for f in sessions_dir.iterdir():
-            if not f.is_file():
+        
+        # Check both legacy chatSessions and new GitHub.copilot-chat/debug-logs structure
+        sessions_dirs = [
+            workspace_dir / "chatSessions",  # legacy
+            workspace_dir / "GitHub.copilot-chat" / "debug-logs",  # current
+        ]
+        
+        for sessions_dir in sessions_dirs:
+            if not sessions_dir.is_dir():
                 continue
-            if f.suffix == ".jsonl":
-                jsonl_results.append((workspace_id, workspace_path, f))
-            elif f.suffix == ".json":
-                legacy_results.append((workspace_id, workspace_path, f))
+            # For GitHub.copilot-chat, descend into session ID directories
+            if "GitHub.copilot-chat" in str(sessions_dir):
+                for session_dir in sessions_dir.iterdir():
+                    if not session_dir.is_dir():
+                        continue
+                    for f in session_dir.iterdir():
+                        if not f.is_file():
+                            continue
+                        if f.suffix == ".jsonl":
+                            jsonl_results.append((workspace_id, workspace_path, f))
+                        elif f.suffix == ".json":
+                            legacy_results.append((workspace_id, workspace_path, f))
+            else:
+                # Legacy chatSessions directory has files directly
+                for f in sessions_dir.iterdir():
+                    if not f.is_file():
+                        continue
+                    if f.suffix == ".jsonl":
+                        jsonl_results.append((workspace_id, workspace_path, f))
+                    elif f.suffix == ".json":
+                        legacy_results.append((workspace_id, workspace_path, f))
 
     log.info(
         "Discovered {} JSONL + {} legacy JSON files across {} workspaces",
