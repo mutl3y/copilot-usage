@@ -3,6 +3,13 @@
 Debug-logs contain detailed telemetry of Copilot API requests including
 actual token counts, model information, and performance metrics.
 This is more complete than session-state since it captures ALL requests.
+
+IMPORTANT: Token Interpretation
+- input_tokens: Includes full conversation history/context sent to API
+- output_tokens: Actual response tokens from the model
+- GitHub typically bills on output tokens only or cached input
+- Each user interaction may spawn multiple API requests (retries, internal calls)
+- Total tokens in debug-logs ≠ GitHub usage dashboard (different counting methods)
 """
 
 from __future__ import annotations
